@@ -1,215 +1,183 @@
-# server.py
-# Flask middleware extensible pour agréger plusieurs APIs (CryptoMeter, QuantConnect, etc.)
+ # server.py
+# AI Trading Middleware – version sécurisée par clé API
+# - Protège tous les endpoints avec une clé envoyée en ?api_key=... ou en header Authorization: Bearer <clé>
+# - Lit la clé attendue dans la variable d'environnement: QuantConnect_API
+# - Fournit des endpoints compatibles avec ton schéma OpenAPI: /, /coinlist/, /ticker/, /tickerlist/, /info/
+# - Réponses JSON homogènes: {"success": "true"|"false", ...}
 
 import os
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Dict, Any, Tuple, Optional
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import requests
 
 app = Flask(__name__)
 CORS(app)
 
-# ==========
-# Config
-# ==========
-CRYPTO_API_KEY = os.getenv("API_KEY")                # <- ta clé CryptoMeter (déjà en place)
-QC_API_KEY      = os.getenv("QuantConnect_API") or os.getenv("QC_API_KEY")  # <- ta clé QuantConnect
+# ============
+# Sécurité API
+# ============
+EXPECTED_API_KEY = os.getenv("QuantConnect_API")  # NOM EXACT de ta variable Render
 
-# Si tu utilises un base URL personnalisé pour QuantConnect plus tard, tu peux le poser ici
-QC_BASE_URL = os.getenv("QC_BASE_URL", "").strip()   # optionnel, vide par défaut
+def _auth_fail(msg: str, code: int = 401):
+    return jsonify({"success": "false", "error": msg}), code
 
-# ==========
-# Mini cache mémoire (TTL) pour alléger les appels
-# ==========
+def require_api_key() -> Optional[Tuple[Any, int]]:
+    """
+    Vérifie la clé API dans:
+      - ?api_key=... (querystring), OU
+      - Authorization: Bearer <clé> (header).
+    """
+    if not EXPECTED_API_KEY:
+        return _auth_fail("server_missing_api_key_env", 500)
+
+    sent = request.args.get("api_key")
+    if not sent:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            sent = auth.replace("Bearer ", "", 1)
+
+    if not sent:
+        return _auth_fail("api_key is missing", 401)
+
+    if sent != EXPECTED_API_KEY:
+        return _auth_fail("api_key is missing or invalid", 401)
+
+    return None  # OK
+
+
+# ==========================
+# Mini cache (TTL en mémoire)
+# ==========================
 _cache: Dict[str, Tuple[float, Any]] = {}
-def cache_get(key: str, ttl_sec: int) -> Optional[Any]:
+CACHE_TTL_SECONDS = 30  # léger cache pour démo
+
+def cache_get(key: str):
     now = time.time()
-    item = _cache.get(key)
-    if not item:
+    v = _cache.get(key)
+    if not v:
         return None
-    ts, data = item
-    if now - ts > ttl_sec:
+    ts, data = v
+    if now - ts > CACHE_TTL_SECONDS:
         _cache.pop(key, None)
         return None
     return data
 
-def cache_set(key: str, value: Any) -> None:
-    _cache[key] = (time.time(), value)
+def cache_put(key: str, data: Any):
+    _cache[key] = (time.time(), data)
+
+
+# ================
+# MOCK / FALLBACKS
+# ================
+# NOTE: En attendant la connexion “live” aux providers en amont,
+# on sert des données de démonstration conformes aux formats attendus.
+# On branchera l’amont (CryptoMeter, etc.) plus tard si besoin.
+
+MOCK_COINLIST = {
+    "binance": [
+        {"market_pair": "BTCUSDT", "pair": "BTC-USDT"},
+        {"market_pair": "ETHUSDT", "pair": "ETH-USDT"},
+        {"market_pair": "BNBUSDT", "pair": "BNB-USDT"},
+    ]
+}
+
+def demo_orderbook(symbol: str):
+    # Snapshot d’orderbook minimal pour démo
+    return {
+        "data": [{
+            "symbol": symbol,
+            "bids": 415.37,
+            "asks": 519.01
+        }],
+        "success": "true",
+        "error": "false"
+    }
+
 
 # ==========
-# Utilitaires HTTP
-# ==========
-def http_get(url: str, params: Dict[str, Any] = None, headers: Dict[str, str] = None, timeout: int = 20):
-    try:
-        r = requests.get(url, params=params or {}, headers=headers or {}, timeout=timeout)
-        # On renvoie toujours la réponse brute + code pour gérer proprement côté middleware
-        return r.status_code, (r.json() if "application/json" in r.headers.get("Content-Type","") else r.text)
-    except requests.RequestException as e:
-        return 599, {"error": str(e)}
-
-# ==========
-# Providers
-# ==========
-class CryptoMeterProvider:
-    """
-    Provider CryptoMeter — proxy simple vers ton compte.
-    Les routes ci-dessous restent compatibles avec tes actions existantes:
-      - /coinlist/?e=binance
-      - /ticker/?e=binance&market_pair=BTCUSDT
-      - /tickerlist/?e=binance
-      - /info/
-    """
-    BASE = "https://cryptometer.io"  # le middleware amont peut varier; à ajuster si besoin
-
-    @staticmethod
-    def _hdr():
-        if not CRYPTO_API_KEY:
-            return {}
-        # La plupart des API attendent un header Authorization ou X-API-KEY; ajuste si besoin :
-        return {"Authorization": f"Bearer {CRYPTO_API_KEY}", "X-API-KEY": CRYPTO_API_KEY}
-
-    @classmethod
-    def coinlist(cls, e: str):
-        # Exemple d’endpoint amont (à adapter selon ta doc CryptoMeter)
-        url = f"{cls.BASE}/coinlist"
-        return http_get(url, params={"e": e}, headers=cls._hdr())
-
-    @classmethod
-    def ticker(cls, e: str, market_pair: str):
-        url = f"{cls.BASE}/ticker"
-        return http_get(url, params={"e": e, "market_pair": market_pair}, headers=cls._hdr())
-
-    @classmethod
-    def tickerlist(cls, e: str):
-        url = f"{cls.BASE}/tickerlist"
-        return http_get(url, params={"e": e}, headers=cls._hdr())
-
-    @classmethod
-    def info(cls):
-        url = f"{cls.BASE}/info"
-        return http_get(url, headers=cls._hdr())
-
-class QuantConnectProvider:
-    """
-    Squelette QuantConnect.
-    - Clé lue dans QuantConnect_API (ou QC_API_KEY).
-    - BASE optionnelle dans QC_BASE_URL (sinon laisse vide et utilise des endpoints spécifiques quand tu les décideras).
-    Remplis/active les méthodes dont tu as besoin (quote, history, etc.) en fonction des endpoints QC que tu veux appeler.
-    """
-    @staticmethod
-    def _hdr():
-        if not QC_API_KEY:
-            return {}
-        # Exemple générique; adapte selon l’auth QC réelle (Bearer / X-API-KEY / Cookie…)
-        return {"Authorization": f"Bearer {QC_API_KEY}", "X-API-KEY": QC_API_KEY}
-
-    @classmethod
-    def ready(cls) -> bool:
-        return bool(QC_API_KEY and QC_BASE_URL)
-
-    @classmethod
-    def ping(cls):
-        if not cls.ready():
-            return 501, {"error": "QuantConnect non configuré. Renseigne QuantConnect_API et QC_BASE_URL.", "success": False}
-        return http_get(f"{QC_BASE_URL}/ping", headers=cls._hdr())
-
-    @classmethod
-    def quote(cls, symbol: str):
-        if not cls.ready():
-            return 501, {"error": "QuantConnect non configuré. Renseigne QuantConnect_API et QC_BASE_URL.", "success": False}
-        # Ex. fictif; remplace par l’endpoint QC exact que tu utiliseras
-        url = f"{QC_BASE_URL}/data/quote"
-        return http_get(url, params={"symbol": symbol}, headers=cls._hdr())
-
-    @classmethod
-    def history(cls, symbol: str, resolution: str = "minute", lookback: int = 1440):
-        if not cls.ready():
-            return 501, {"error": "QuantConnect non configuré. Renseigne QuantConnect_API et QC_BASE_URL.", "success": False}
-        # Ex. fictif; remplace par l’endpoint QC exact
-        url = f"{QC_BASE_URL}/data/history"
-        return http_get(url, params={"symbol": symbol, "resolution": resolution, "lookback": lookback}, headers=cls._hdr())
-
-# ==========
-# Routes publiques (stables pour tes actions actuelles)
+# ENDPOINTS
 # ==========
 @app.get("/")
 def ping():
-    return jsonify({"status": "ok", "providers": {
-        "cryptometer": bool(CRYPTO_API_KEY),
-        "quantconnect_key": bool(QC_API_KEY),
-        "quantconnect_ready": QuantConnectProvider.ready()
-    }})
+    auth = require_api_key()
+    if auth: 
+        return auth
+    return jsonify({"status": "ok", "success": "true"})
 
 @app.get("/coinlist/")
-def coinlist():
-    e = request.args.get("e", "").strip()
+def get_coinlist():
+    auth = require_api_key()
+    if auth: 
+        return auth
+
+    e = (request.args.get("e") or "").strip().lower()
     if not e:
-        return jsonify({"success": False, "error": "e (exchange) est requis"}), 400
+        return jsonify({"success": "false", "error": "param_e_missing"}), 400
 
     cache_key = f"coinlist:{e}"
-    cached = cache_get(cache_key, ttl_sec=60)  # 1 minute
+    cached = cache_get(cache_key)
     if cached:
-        return jsonify({"success": True, "data": cached})
+        return jsonify({"data": cached, "success": "true", "error": "false"})
 
-    code, data = CryptoMeterProvider.coinlist(e)
-    if code == 200:
-        cache_set(cache_key, data)
-        return jsonify({"success": True, "data": data})
-    return jsonify({"success": False, "error": data}), code
+    data = MOCK_COINLIST.get(e)
+    if not data:
+        # Exchange pas dans la démo -> message explicite
+        return jsonify({"success": "false", "error": f"exchange_not_supported_demo:{e}"}), 404
+
+    cache_put(cache_key, data)
+    return jsonify({"data": data, "success": "true", "error": "false"})
 
 @app.get("/ticker/")
-def ticker():
-    e = request.args.get("e", "").strip()
-    pair = request.args.get("market_pair", "").strip()
-    if not e or not pair:
-        return jsonify({"success": False, "error": "Paramètres requis: e, market_pair"}), 400
-    code, data = CryptoMeterProvider.ticker(e, pair)
-    return (jsonify({"success": True, "data": data}), 200) if code == 200 else (jsonify({"success": False, "error": data}), code)
+def get_ticker():
+    auth = require_api_key()
+    if auth: 
+        return auth
+
+    e = (request.args.get("e") or "").strip().lower()
+    mp = (request.args.get("market_pair") or "").strip().upper()
+
+    if not e:
+        return jsonify({"success": "false", "error": "param_e_missing"}), 400
+    if not mp:
+        return jsonify({"success": "false", "error": "market_pair is missing"}), 400
+
+    # Démo simple
+    return jsonify(demo_orderbook(mp))
 
 @app.get("/tickerlist/")
-def tickerlist():
-    e = request.args.get("e", "").strip()
+def get_tickerlist():
+    auth = require_api_key()
+    if auth: 
+        return auth
+
+    e = (request.args.get("e") or "").strip().lower()
     if not e:
-        return jsonify({"success": False, "error": "e (exchange) est requis"}), 400
-    code, data = CryptoMeterProvider.tickerlist(e)
-    return (jsonify({"success": True, "data": data}), 200) if code == 200 else (jsonify({"success": False, "error": data}), code)
+        return jsonify({"success": "false", "error": "param_e_missing"}), 400
+
+    # Démo: retourne 3 tickers “orderbook” pour l’exchange demandé
+    symbols = [x["market_pair"] for x in MOCK_COINLIST.get(e, [])]
+    if not symbols:
+        return jsonify({"success": "false", "error": f"exchange_not_supported_demo:{e}"}), 404
+
+    data = [demo_orderbook(sym)["data"][0] for sym in symbols]
+    return jsonify({"data": data, "success": "true", "error": "false"})
 
 @app.get("/info/")
-def info():
-    code, data = CryptoMeterProvider.info()
-    return (jsonify({"success": True, "data": data}), 200) if code == 200 else (jsonify({"success": False, "error": data}), code)
+def get_api_usage_info():
+    auth = require_api_key()
+    if auth: 
+        return auth
 
-# ==========
-# Pré-routes QuantConnect (tu pourras en créer d’autres très facilement)
-# ==========
-@app.get("/qc/ping")
-def qc_ping():
-    code, data = QuantConnectProvider.ping()
-    return (jsonify({"success": code == 200, "data" if code == 200 else "error": data}), code)
+    # Démo: renvoie juste l’état de la variable d’environnement
+    return jsonify({
+        "success": "true",
+        "error": "false",
+        "env_ok": bool(EXPECTED_API_KEY),
+        "env_var": "QuantConnect_API"
+    })
 
-@app.get("/qc/quote")
-def qc_quote():
-    symbol = request.args.get("symbol", "").strip().upper()
-    if not symbol:
-        return jsonify({"success": False, "error": "symbol est requis"}), 400
-    code, data = QuantConnectProvider.quote(symbol)
-    return (jsonify({"success": code == 200, "data" if code == 200 else "error": data}), code)
 
-@app.get("/qc/history")
-def qc_history():
-    symbol = request.args.get("symbol", "").strip().upper()
-    resolution = request.args.get("resolution", "minute")
-    lookback = int(request.args.get("lookback", "1440"))
-    if not symbol:
-        return jsonify({"success": False, "error": "symbol est requis"}), 400
-    code, data = QuantConnectProvider.history(symbol, resolution, lookback)
-    return (jsonify({"success": code == 200, "data" if code == 200 else "error": data}), code)
-
-# ==========
-# Lancement
-# ==========
 if __name__ == "__main__":
-    # Pour exécution locale; Render utilisera gunicorn via Procfile
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+    # Pour lancement local éventuel: python server.py
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
