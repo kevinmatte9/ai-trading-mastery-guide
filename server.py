@@ -4,7 +4,7 @@
 # - Lit la clé attendue dans la variable d'environnement: QuantConnect_API
 # - Relaye les appels vers CryptoMeter (ou autre amont) en lisant:
 #     UPSTREAM_BASE_URL, UPSTREAM_API_KEY, UPSTREAM_API_KEY_NAME, UPSTREAM_AUTH_MODE
-# - Endpoints compatibles OpenAPI: /, /coinlist/, /ticker/, /tickerlist/, /info/
+# - Endpoints compatibles OpenAPI: /, /coinlist/, /ticker/, /tickerlist/, /info/, /limits/
 # - Réponses JSON homogènes: {"success": "true"|"false", ...}
 
 import os
@@ -96,7 +96,6 @@ def upstream_get(path: str, params: Dict[str, Any]):
     try:
         r = requests.get(url, params=q, headers=headers, timeout=12)
         r.raise_for_status()
-        # CryptoMeter renvoie déjà du JSON
         return jsonify(r.json())
     except requests.HTTPError as e:
         code = e.response.status_code if e.response is not None else 502
@@ -125,14 +124,12 @@ def get_coinlist():
     if not e:
         return jsonify({"success": "false", "error": "param_e_missing"}), 400
 
-    # Option: petit cache
     cache_key = f"coinlist:{e}"
     cached = cache_get(cache_key)
     if cached:
         return jsonify(cached)
 
     resp = upstream_get("/coinlist/", {"e": e})
-    # on ne met en cache que si success true
     try:
         data = resp.get_json(silent=True) or {}
         if data.get("success") == "true":
@@ -188,7 +185,15 @@ def get_api_usage_info():
         }
     })
 
+@app.get("/limits/")
+def get_limits():
+    auth = require_api_key()
+    if auth:
+        return auth
+
+    # Relais direct vers l'endpoint "limits" de CryptoMeter
+    return upstream_get("/limits/", {})
+
 
 if __name__ == "__main__":
-    # Pour lancement local éventuel: python server.py
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
