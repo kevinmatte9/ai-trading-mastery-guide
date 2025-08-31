@@ -50,7 +50,8 @@ CACHE_TTL_SECONDS = 30
 
 def cache_get(key: str):
     v = _cache.get(key)
-    if not v: return None
+    if not v:
+        return None
     ts, data = v
     if time.time() - ts > CACHE_TTL_SECONDS:
         _cache.pop(key, None)
@@ -118,7 +119,10 @@ def openai_generate(prompt: str, style: str = ""):
         "temperature": 0.4,
         "max_tokens": 800
     }
-    headers = {"Authorization": f"Bearer {OA_KEY}"}
+    headers = {
+        "Authorization": f"Bearer {OA_KEY}",
+        "Content-Type": "application/json"
+    }
 
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=20)
@@ -138,13 +142,15 @@ def openai_generate(prompt: str, style: str = ""):
 @app.get("/")
 def ping():
     auth = require_api_key()
-    if auth: return auth
+    if auth:
+        return auth
     return jsonify({"status": "ok", "success": "true"})
 
 @app.get("/coinlist/")
 def get_coinlist():
     auth = require_api_key()
-    if auth: return auth
+    if auth:
+        return auth
 
     e = (request.args.get("e") or "").strip().lower()
     if not e:
@@ -152,7 +158,8 @@ def get_coinlist():
 
     cache_key = f"coinlist:{e}"
     cached = cache_get(cache_key)
-    if cached: return jsonify(cached)
+    if cached:
+        return jsonify(cached)
 
     resp = upstream_get("/coinlist/", {"e": e})
     try:
@@ -166,7 +173,8 @@ def get_coinlist():
 @app.get("/ticker/")
 def get_ticker():
     auth = require_api_key()
-    if auth: return auth
+    if auth:
+        return auth
 
     e  = (request.args.get("e") or "").strip().lower()
     mp = (request.args.get("market_pair") or "").strip().upper()
@@ -179,7 +187,8 @@ def get_ticker():
 @app.get("/tickerlist/")
 def get_tickerlist():
     auth = require_api_key()
-    if auth: return auth
+    if auth:
+        return auth
 
     e = (request.args.get("e") or "").strip().lower()
     if not e:
@@ -189,7 +198,8 @@ def get_tickerlist():
 @app.get("/info/")
 def get_api_usage_info():
     auth = require_api_key()
-    if auth: return auth
+    if auth:
+        return auth
 
     return jsonify({
         "success": "true",
@@ -207,7 +217,8 @@ def get_api_usage_info():
 @app.get("/limits/")
 def get_limits():
     auth = require_api_key()
-    if auth: return auth
+    if auth:
+        return auth
     return upstream_get("/limits/", {})
 
 @app.post("/gen/")
@@ -216,7 +227,8 @@ def gen_text():
     Body JSON: { "prompt": "...", "style": "optionnel" }
     """
     auth = require_api_key()
-    if auth: return auth
+    if auth:
+        return auth
 
     body = request.get_json(silent=True) or {}
     prompt = (body.get("prompt") or "").strip()
@@ -227,3 +239,4 @@ def gen_text():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+```0
