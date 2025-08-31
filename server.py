@@ -1,13 +1,17 @@
- # server.py
+# server.py
 # AI Trading Middleware – version sécurisée par clé API
 # - Protège tous les endpoints avec une clé envoyée en ?api_key=... ou en header Authorization: Bearer <clé>
 # - Lit la clé attendue dans la variable d'environnement: QuantConnect_API
-# - Fournit des endpoints compatibles avec ton schéma OpenAPI: /, /coinlist/, /ticker/, /tickerlist/, /info/
+# - Relaye les appels vers CryptoMeter (ou autre amont) en lisant:
+#     UPSTREAM_BASE_URL, UPSTREAM_API_KEY, UPSTREAM_API_KEY_NAME, UPSTREAM_AUTH_MODE
+# - Endpoints compatibles OpenAPI: /, /coinlist/, /ticker/, /tickerlist/, /info/
 # - Réponses JSON homogènes: {"success": "true"|"false", ...}
 
 import os
 import time
 from typing import Dict, Any, Tuple, Optional
+
+import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
@@ -67,32 +71,38 @@ def cache_put(key: str, data: Any):
     _cache[key] = (time.time(), data)
 
 
-# ================
-# MOCK / FALLBACKS
-# ================
-# NOTE: En attendant la connexion “live” aux providers en amont,
-# on sert des données de démonstration conformes aux formats attendus.
-# On branchera l’amont (CryptoMeter, etc.) plus tard si besoin.
+# ==========================
+# Config de l'amont (CryptoMeter)
+# ==========================
+UP_BASE   = os.getenv("UPSTREAM_BASE_URL", "https://api.cryptometer.io")
+UP_KEY    = os.getenv("UPSTREAM_API_KEY", "")
+UP_KEYNAM = os.getenv("UPSTREAM_API_KEY_NAME", "api_key")
+UP_AUTH   = os.getenv("UPSTREAM_AUTH_MODE", "query")  # "query" ou "bearer"
 
-MOCK_COINLIST = {
-    "binance": [
-        {"market_pair": "BTCUSDT", "pair": "BTC-USDT"},
-        {"market_pair": "ETHUSDT", "pair": "ETH-USDT"},
-        {"market_pair": "BNBUSDT", "pair": "BNB-USDT"},
-    ]
-}
+def upstream_get(path: str, params: Dict[str, Any]):
+    """Relais GET vers l'amont avec gestion clé en query ou bearer."""
+    if not UP_KEY:
+        return _auth_fail("upstream_key_missing", 500)
 
-def demo_orderbook(symbol: str):
-    # Snapshot d’orderbook minimal pour démo
-    return {
-        "data": [{
-            "symbol": symbol,
-            "bids": 415.37,
-            "asks": 519.01
-        }],
-        "success": "true",
-        "error": "false"
-    }
+    url = f"{UP_BASE.rstrip('/')}/{path.lstrip('/')}"
+    headers: Dict[str, str] = {}
+    q = dict(params)
+
+    if UP_AUTH.lower() == "bearer":
+        headers["Authorization"] = f"Bearer {UP_KEY}"
+    else:
+        q[UP_KEYNAM] = UP_KEY  # par défaut CryptoMeter: ?api_key=
+
+    try:
+        r = requests.get(url, params=q, headers=headers, timeout=12)
+        r.raise_for_status()
+        # CryptoMeter renvoie déjà du JSON
+        return jsonify(r.json())
+    except requests.HTTPError as e:
+        code = e.response.status_code if e.response is not None else 502
+        return jsonify({"success": "false", "error": f"upstream_http_{code}"}), 502
+    except Exception:
+        return jsonify({"success": "false", "error": "upstream_unreachable"}), 502
 
 
 # ==========
@@ -101,40 +111,43 @@ def demo_orderbook(symbol: str):
 @app.get("/")
 def ping():
     auth = require_api_key()
-    if auth: 
+    if auth:
         return auth
     return jsonify({"status": "ok", "success": "true"})
 
 @app.get("/coinlist/")
 def get_coinlist():
     auth = require_api_key()
-    if auth: 
+    if auth:
         return auth
 
     e = (request.args.get("e") or "").strip().lower()
     if not e:
         return jsonify({"success": "false", "error": "param_e_missing"}), 400
 
+    # Option: petit cache
     cache_key = f"coinlist:{e}"
     cached = cache_get(cache_key)
     if cached:
-        return jsonify({"data": cached, "success": "true", "error": "false"})
+        return jsonify(cached)
 
-    data = MOCK_COINLIST.get(e)
-    if not data:
-        # Exchange pas dans la démo -> message explicite
-        return jsonify({"success": "false", "error": f"exchange_not_supported_demo:{e}"}), 404
-
-    cache_put(cache_key, data)
-    return jsonify({"data": data, "success": "true", "error": "false"})
+    resp = upstream_get("/coinlist/", {"e": e})
+    # on ne met en cache que si success true
+    try:
+        data = resp.get_json(silent=True) or {}
+        if data.get("success") == "true":
+            cache_put(cache_key, data)
+    except Exception:
+        pass
+    return resp
 
 @app.get("/ticker/")
 def get_ticker():
     auth = require_api_key()
-    if auth: 
+    if auth:
         return auth
 
-    e = (request.args.get("e") or "").strip().lower()
+    e  = (request.args.get("e") or "").strip().lower()
     mp = (request.args.get("market_pair") or "").strip().upper()
 
     if not e:
@@ -142,39 +155,37 @@ def get_ticker():
     if not mp:
         return jsonify({"success": "false", "error": "market_pair is missing"}), 400
 
-    # Démo simple
-    return jsonify(demo_orderbook(mp))
+    return upstream_get("/ticker/", {"e": e, "market_pair": mp})
 
 @app.get("/tickerlist/")
 def get_tickerlist():
     auth = require_api_key()
-    if auth: 
+    if auth:
         return auth
 
     e = (request.args.get("e") or "").strip().lower()
     if not e:
         return jsonify({"success": "false", "error": "param_e_missing"}), 400
 
-    # Démo: retourne 3 tickers “orderbook” pour l’exchange demandé
-    symbols = [x["market_pair"] for x in MOCK_COINLIST.get(e, [])]
-    if not symbols:
-        return jsonify({"success": "false", "error": f"exchange_not_supported_demo:{e}"}), 404
-
-    data = [demo_orderbook(sym)["data"][0] for sym in symbols]
-    return jsonify({"data": data, "success": "true", "error": "false"})
+    return upstream_get("/tickerlist/", {"e": e})
 
 @app.get("/info/")
 def get_api_usage_info():
     auth = require_api_key()
-    if auth: 
+    if auth:
         return auth
 
-    # Démo: renvoie juste l’état de la variable d’environnement
     return jsonify({
         "success": "true",
         "error": "false",
         "env_ok": bool(EXPECTED_API_KEY),
-        "env_var": "QuantConnect_API"
+        "env_var": "QuantConnect_API",
+        "upstream": {
+            "base_url": UP_BASE,
+            "auth_mode": UP_AUTH,
+            "key_name": UP_KEYNAM,
+            "has_key": bool(UP_KEY)
+        }
     })
 
 
