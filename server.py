@@ -3,7 +3,7 @@
 # - Accès protégé par ?api_key=... ou Authorization: Bearer <clé> (env: QuantConnect_API)
 # - Relais CryptoMeter (env: UPSTREAM_BASE_URL, UPSTREAM_API_KEY, UPSTREAM_API_KEY_NAME, UPSTREAM_AUTH_MODE)
 # - Génération de texte OpenAI (env: OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL)
-# - Endpoints: /, /coinlist/, /ticker/, /tickerlist/, /info/, /limits/, /gen/
+# - Endpoints: /, /ping, /coinlist/, /ticker/, /tickerlist/, /info/, /limits/, /gen/
 # - Réponses JSON homogènes: {"success": "true"|"false", ...}
 
 import os
@@ -20,7 +20,7 @@ CORS(app)
 # ============
 # Sécurité API
 # ============
-EXPECTED_API_KEY = os.getenv("QuantConnect_API")  # NOM EXACT sur Render
+EXPECTED_API_KEY = os.getenv("QuantConnect_API")
 
 def _auth_fail(msg: str, code: int = 401):
     return jsonify({"success": "false", "error": msg}), code
@@ -43,7 +43,7 @@ def require_api_key() -> Optional[Tuple[Any, int]]:
     return None  # OK
 
 # ==========================
-# Mini cache (TTL mémoire)
+# Mini cache
 # ==========================
 _cache: Dict[str, Tuple[float, Any]] = {}
 CACHE_TTL_SECONDS = 30
@@ -62,12 +62,12 @@ def cache_put(key: str, data: Any):
     _cache[key] = (time.time(), data)
 
 # ==========================
-# Config amont CryptoMeter
+# Config CryptoMeter
 # ==========================
 UP_BASE   = os.getenv("UPSTREAM_BASE_URL", "https://api.cryptometer.io")
 UP_KEY    = os.getenv("UPSTREAM_API_KEY", "")
 UP_KEYNAM = os.getenv("UPSTREAM_API_KEY_NAME", "api_key")
-UP_AUTH   = os.getenv("UPSTREAM_AUTH_MODE", "query")  # "query" ou "bearer"
+UP_AUTH   = os.getenv("UPSTREAM_AUTH_MODE", "query")
 
 def upstream_get(path: str, params: Dict[str, Any]):
     """Relais GET vers l'amont (clé en query ou bearer)."""
@@ -81,7 +81,7 @@ def upstream_get(path: str, params: Dict[str, Any]):
     if UP_AUTH.lower() == "bearer":
         headers["Authorization"] = f"Bearer {UP_KEY}"
     else:
-        q[UP_KEYNAM] = UP_KEY  # par défaut: ?api_key=
+        q[UP_KEYNAM] = UP_KEY
 
     try:
         r = requests.get(url, params=q, headers=headers, timeout=12)
@@ -94,14 +94,13 @@ def upstream_get(path: str, params: Dict[str, Any]):
         return jsonify({"success": "false", "error": "upstream_unreachable"}), 502
 
 # ==========================
-# Config OpenAI (texte)
+# Config OpenAI
 # ==========================
 OA_KEY   = os.getenv("OPENAI_API_KEY", "")
 OA_BASE  = os.getenv("OPENAI_BASE_URL", "https://api.openai.com")
 OA_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 def openai_generate(prompt: str, style: str = ""):
-    """Appel simple à OpenAI Chat Completions."""
     if not OA_KEY:
         return _auth_fail("openai_key_missing", 500)
 
@@ -140,27 +139,29 @@ def openai_generate(prompt: str, style: str = ""):
 # ENDPOINTS
 # ==========
 @app.get("/")
-def ping():
+def home():
     auth = require_api_key()
     if auth:
         return auth
     return jsonify({"status": "ok", "success": "true"})
+
+@app.get("/ping")
+def ping():
+    """Test rapide dans navigateur sans dépendances."""
+    return jsonify({"status": "ok", "message": "Le serveur tourne 🚀"})
 
 @app.get("/coinlist/")
 def get_coinlist():
     auth = require_api_key()
     if auth:
         return auth
-
     e = (request.args.get("e") or "").strip().lower()
     if not e:
         return jsonify({"success": "false", "error": "param_e_missing"}), 400
-
     cache_key = f"coinlist:{e}"
     cached = cache_get(cache_key)
     if cached:
         return jsonify(cached)
-
     resp = upstream_get("/coinlist/", {"e": e})
     try:
         data = resp.get_json(silent=True) or {}
@@ -175,7 +176,6 @@ def get_ticker():
     auth = require_api_key()
     if auth:
         return auth
-
     e  = (request.args.get("e") or "").strip().lower()
     mp = (request.args.get("market_pair") or "").strip().upper()
     if not e:
@@ -189,7 +189,6 @@ def get_tickerlist():
     auth = require_api_key()
     if auth:
         return auth
-
     e = (request.args.get("e") or "").strip().lower()
     if not e:
         return jsonify({"success": "false", "error": "param_e_missing"}), 400
@@ -200,7 +199,6 @@ def get_api_usage_info():
     auth = require_api_key()
     if auth:
         return auth
-
     return jsonify({
         "success": "true",
         "error": "false",
@@ -223,13 +221,9 @@ def get_limits():
 
 @app.post("/gen/")
 def gen_text():
-    """Génère du texte via OpenAI.
-    Body JSON: { "prompt": "...", "style": "optionnel" }
-    """
     auth = require_api_key()
     if auth:
         return auth
-
     body = request.get_json(silent=True) or {}
     prompt = (body.get("prompt") or "").strip()
     style  = (body.get("style") or "").strip()
